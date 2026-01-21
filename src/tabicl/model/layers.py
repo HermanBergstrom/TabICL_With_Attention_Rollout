@@ -259,7 +259,8 @@ class MultiheadAttention(nn.MultiheadAttention):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
-    ) -> Tensor:
+        need_weights: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Compute multi-head attention with support for rotary positional encoding.
 
         Parameters
@@ -290,10 +291,14 @@ class MultiheadAttention(nn.MultiheadAttention):
         rope : Optional[RotaryEmbedding]
             Rotary positional encoding
 
+        need_weights : bool, default=False
+            Whether to return attention weights alongside the output
+
         Returns
         -------
-        Tensor
-            Attention output of shape (..., tgt_len, embed_dim)
+        Tensor | tuple[Tensor, Tensor]
+            If need_weights=False: Attention output of shape (..., tgt_len, embed_dim)
+            If need_weights=True: Tuple of (output, attention weights of shape (..., num_heads, tgt_len, src_len))
         """
 
         if isinstance(attn_mask, int):
@@ -314,6 +319,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
             rope=rope,
+            need_weights=need_weights,
         )
 
 
@@ -371,7 +377,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
-    ) -> Tensor:
+        need_weights: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Process input through attention with optional rotary positional encoding.
 
         Parameters
@@ -404,10 +411,14 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         rope : Optional[RotaryEmbedding]
             Rotary positional encoding
 
+        need_weights : bool, default=False
+            Whether to return attention weights alongside the output
+
         Returns
         -------
-        Tensor
-            Output tensor of shape (..., tgt_len, d_model)
+        Tensor | tuple[Tensor, Tensor]
+            If need_weights=False: Output tensor of shape (..., tgt_len, d_model)
+            If need_weights=True: Tuple of (output, attention weights of shape (..., num_heads, tgt_len, src_len))
         """
 
         if isinstance(attn_mask, int):
@@ -439,16 +450,27 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         x = q
         if self.norm_first:
             # Pre-norm: normalize before attention and FFN
-            attn = self._attn_block(self.norm1(q), self.norm1(k), self.norm1(v), key_padding_mask, attn_mask, rope)
+            attn_result = self._attn_block(self.norm1(q), self.norm1(k), self.norm1(v), key_padding_mask, attn_mask, rope, need_weights)
+            if need_weights:
+                attn, attn_weights = attn_result
+            else:
+                attn = attn_result
             x = x + attn
             x = x + self._ff_block(self.norm2(x))
         else:
             # Post-norm: normalize after attention and FFN
-            attn = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope)
+            attn_result = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, need_weights)
+            if need_weights:
+                attn, attn_weights = attn_result
+            else:
+                attn = attn_result
             x = self.norm1(x + attn)
             x = self.norm2(x + self._ff_block(x))
-
-        return x
+        #breakpoint()
+        if need_weights:
+            return x, attn_weights
+        else:
+            return x
 
     def _attn_block(
         self,
@@ -458,9 +480,14 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[Tensor],
         attn_mask: Optional[Tensor | int],
         rope: Optional[RotaryEmbedding],
-    ) -> Tensor:
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope)
-        return self.dropout1(attn)
+        need_weights: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        attn_result = self.attn(q, k, v, key_padding_mask, attn_mask, rope, need_weights)
+        if need_weights:
+            attn, attn_weights = attn_result
+            return self.dropout1(attn), attn_weights
+        else:
+            return self.dropout1(attn_result)
 
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))

@@ -86,7 +86,7 @@ class RowInteraction(nn.Module):
 
         self.inference_mgr = InferenceManager(enc_name="tf_row", out_dim=embed_dim * self.num_cls, out_no_seq=True)
 
-    def _aggregate_embeddings(self, embeddings: Tensor, key_mask: Optional[Tensor] = None) -> Tensor:
+    def _aggregate_embeddings(self, embeddings: Tensor, key_mask: Optional[Tensor] = None, return_attention_rollout: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """Process a batch of rows through a transformer encoder.
 
         This method:
@@ -104,21 +104,34 @@ class RowInteraction(nn.Module):
              - C is the number of class tokens
              - E is the embedding dimension
 
+        return_attention_rollout : bool, default=False
+            Whether to return attention rollout from the transformer encoder
+
         Returns
         -------
-        Tensor
-            Flattened class token outputs of shape (B*T, C*E)
+        Tensor | tuple[Tensor, Tensor]
+            If return_attention_rollout=False: Flattened class token outputs of shape (B*T, C*E)
+            If return_attention_rollout=True: Tuple of (class token outputs, attention rollout matrix)
         """
-
-        outputs = self.tf_row(embeddings, key_padding_mask=key_mask)  # (B, T, H+C, E)
+        
+        if return_attention_rollout:
+            #TODO: Look at the interplay between the attention rollout and the attn_mask in attention.py
+            #Calculated twice, might need to be corrected
+            outputs, attention_rollout = self.tf_row(embeddings, key_padding_mask=key_mask, attention_rollout=True)  # (B, T, H+C, E)
+        else:
+            outputs = self.tf_row(embeddings, key_padding_mask=key_mask)  # (B, T, H+C, E)
+    
         cls_outputs = outputs[..., : self.num_cls, :].clone()  # (B, T, C, E)
         del outputs  # Delete intermediate outputs to save memory
 
         cls_outputs = self.out_ln(cls_outputs)
 
-        return cls_outputs.flatten(-2)  # (B, T, C*E)
+        if return_attention_rollout:
+            return cls_outputs.flatten(-2), attention_rollout  # (B, T, C*E), (B, T, H+C, H+C)
+        else:
+            return cls_outputs.flatten(-2)  # (B, T, C*E)
 
-    def _train_forward(self, embeddings: Tensor, d: Optional[Tensor] = None) -> Tensor:
+    def _train_forward(self, embeddings: Tensor, d: Optional[Tensor] = None, return_attention_rollout: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """Transform feature embeddings into row representations for training.
 
         Parameters
@@ -134,10 +147,14 @@ class RowInteraction(nn.Module):
         d : Optional[Tensor], default=None
             The number of features per dataset. Used only in training mode.
 
+        return_attention_rollout : bool, default=False
+            Whether to return attention rollout from the row interaction transformer
+
         Returns
         -------
-        Tensor
-            Row representations of shape (B, T, C*E) where C is the number of class tokens
+        Tensor | tuple[Tensor, Tensor]
+            If return_attention_rollout=False: Row representations of shape (B, T, C*E)
+            If return_attention_rollout=True: Tuple of (row representations, attention rollout matrix)
         """
 
         B, T, HC, E = embeddings.shape
@@ -154,11 +171,14 @@ class RowInteraction(nn.Module):
             indices = torch.arange(HC, device=device).view(1, 1, HC).expand(B, T, HC)
             key_mask = indices >= d.view(B, 1, 1)  # (B, T, HC)
 
-        representations = self._aggregate_embeddings(embeddings, key_mask)  # (B, T, C*E)
+        if return_attention_rollout:
+            representations, attention_rollout = self._aggregate_embeddings(embeddings, key_mask, return_attention_rollout=True)  # (B, T, C*E), rollout
+            return representations, attention_rollout
+        else:
+            representations = self._aggregate_embeddings(embeddings, key_mask)  # (B, T, C*E)
+            return representations  # (B, T, C*E)
 
-        return representations  # (B, T, C*E)
-
-    def _inference_forward(self, embeddings: Tensor, mgr_config: MgrConfig = None) -> Tensor:
+    def _inference_forward(self, embeddings: Tensor, mgr_config: MgrConfig = None, return_attention_rollout: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """Transform feature embeddings into row representations for inference.
 
         Parameters
@@ -174,10 +194,14 @@ class RowInteraction(nn.Module):
         mgr_config : MgrConfig, default=None
             Configuration for InferenceManager
 
+        return_attention_rollout : bool, default=False
+            Whether to return attention rollout from the row interaction transformer
+
         Returns
         -------
-        Tensor
-            Row representations of shape (B, T, C*E) where C is the number of class tokens
+        Tensor | tuple[Tensor, Tensor]
+            If return_attention_rollout=False: Row representations of shape (B, T, C*E)
+            If return_attention_rollout=True: Tuple of (row representations, attention rollout matrix)
         """
         # Configure inference parameters
         if mgr_config is None:
@@ -195,13 +219,18 @@ class RowInteraction(nn.Module):
         B, T = embeddings.shape[:2]
         cls_tokens = self.cls_tokens.expand(B, T, self.num_cls, self.embed_dim)
         embeddings[:, :, : self.num_cls] = cls_tokens.to(embeddings.device)
-        representations = self.inference_mgr(
-            self._aggregate_embeddings, inputs=OrderedDict([("embeddings", embeddings)])
-        )
+        
+        if return_attention_rollout:
+            # Cannot use inference manager with rollout, need direct call
+            result = self._aggregate_embeddings(embeddings, return_attention_rollout=True)
+            return result  # (B, T, C*E), rollout
+        else:
+            representations = self.inference_mgr(
+                self._aggregate_embeddings, inputs=OrderedDict([("embeddings", embeddings)])
+            )
+            return representations  # (B, T, C*E)
 
-        return representations  # (B, T, C*E)
-
-    def forward(self, embeddings: Tensor, d: Optional[Tensor] = None, mgr_config: MgrConfig = None) -> Tensor:
+    def forward(self, embeddings: Tensor, d: Optional[Tensor] = None, mgr_config: MgrConfig = None, return_attention_rollout: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """Transform feature embeddings into row representations.
 
         Parameters
@@ -220,15 +249,19 @@ class RowInteraction(nn.Module):
         mgr_config : MgrConfig, default=None
             Configuration for InferenceManager. Used only in inference mode.
 
+        return_attention_rollout : bool, default=False
+            Whether to return attention rollout from the row interaction transformer
+
         Returns
         -------
-        Tensor
-            Row representations of shape (B, T, C*E) where C is the number of class tokens
+        Tensor | tuple[Tensor, Tensor]
+            If return_attention_rollout=False: Row representations of shape (B, T, C*E)
+            If return_attention_rollout=True: Tuple of (row representations, attention rollout matrix)
         """
 
         if self.training:
-            representations = self._train_forward(embeddings, d)
+            result = self._train_forward(embeddings, d, return_attention_rollout=return_attention_rollout)
         else:
-            representations = self._inference_forward(embeddings, mgr_config)
+            result = self._inference_forward(embeddings, mgr_config, return_attention_rollout=return_attention_rollout)
 
-        return representations  # (B, T, C*E)
+        return result

@@ -201,7 +201,7 @@ class ICLearning(nn.Module):
         indices = unique_vals.argsort()
         return indices[torch.searchsorted(unique_vals, y)]
 
-    def _icl_predictions(self, R: Tensor, y_train: Tensor) -> Tensor:
+    def _icl_predictions(self, R: Tensor, y_train: Tensor,return_attention_rollout: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning predictions.
 
         Parameters
@@ -219,12 +219,19 @@ class ICLearning(nn.Module):
 
         train_size = y_train.shape[1]
         R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
-        src = self.tf_icl(R, attn_mask=train_size)
+        if return_attention_rollout:
+            src, attention_rollout = self.tf_icl(R, attn_mask=train_size, attention_rollout=True)
+        else:
+            src = self.tf_icl(R, attn_mask=train_size)
         if self.norm_first:
             src = self.ln(src)
-        out = self.decoder(src)  # (B, T, max_classes)
 
-        return out
+        out = self.decoder(src)  # (B, T, max_classes)
+        
+        if return_attention_rollout:
+            return out, attention_rollout
+        else:
+            return out
 
     def _predict_standard(
         self,
@@ -233,7 +240,8 @@ class ICLearning(nn.Module):
         return_logits: bool = False,
         softmax_temperature: float = 0.9,
         auto_batch: bool = True,
-    ) -> Tensor:
+        return_attention_rollout: bool = False
+        ) -> Tensor | tuple[Tensor, Tensor]:
         """Generate predictions for standard classification with up to `max_classes` classes.
 
         Parameters
@@ -260,15 +268,22 @@ class ICLearning(nn.Module):
 
         train_size = y_train.shape[1]
         num_classes = len(torch.unique(y_train[0]))
-        out = self.inference_mgr(
-            self._icl_predictions, inputs=OrderedDict([("R", R), ("y_train", y_train)]), auto_batch=auto_batch
-        )
+        
+        if return_attention_rollout:
+            out, attention_rollout = self._icl_predictions(R, y_train, return_attention_rollout=True)
+        else:
+            out = self.inference_mgr(
+                self._icl_predictions, inputs=OrderedDict([("R", R), ("y_train", y_train)]), auto_batch=auto_batch
+            )
         out = out[:, train_size:, :num_classes]
 
         if not return_logits:
             out = torch.softmax(out / softmax_temperature, dim=-1)
 
-        return out
+        if return_attention_rollout:
+            return out, attention_rollout
+        else:
+            return out
 
     def _predict_hierarchical(self, R_test: Tensor, softmax_temperature: float = 0.9) -> Tensor:
         """Generate predictions using the hierarchical classification tree.
@@ -350,7 +365,8 @@ class ICLearning(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         mgr_config: MgrConfig = None,
-    ) -> Tensor:
+        return_attention_rollout: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations for inference.
 
         Parameters
@@ -400,9 +416,11 @@ class ICLearning(nn.Module):
         if num_classes <= self.max_classes:
             # Standard classification
             out = self._predict_standard(
-                R, y_train, return_logits=return_logits, softmax_temperature=softmax_temperature
+                R, y_train, return_logits=return_logits, softmax_temperature=softmax_temperature,
+                return_attention_rollout=return_attention_rollout
             )
         else:
+            raise NotImplementedError("Not fixed this to work with rollout yet.")
             # Hierarchical classification
             out = []
             train_size = y_train.shape[1]
@@ -427,7 +445,8 @@ class ICLearning(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         mgr_config: MgrConfig = None,
-    ) -> Tensor:
+        return_attention_rollout: bool = False
+        ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations.
 
         Parameters
@@ -463,9 +482,16 @@ class ICLearning(nn.Module):
 
         if self.training:
             train_size = y_train.shape[1]
-            out = self._icl_predictions(R, y_train)
+            out = self._icl_predictions(R, y_train, return_attention_rollout=return_attention_rollout)
+            if return_attention_rollout:
+                out, attention_rollout = out
             out = out[:, train_size:]
         else:
-            out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
+            out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config, return_attention_rollout=return_attention_rollout)
+            if return_attention_rollout:
+                out, attention_rollout = out
 
-        return out
+        if return_attention_rollout:
+            return out, attention_rollout
+        else:
+            return out

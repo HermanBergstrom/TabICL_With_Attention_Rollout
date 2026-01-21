@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import torch
 from torch import nn, Tensor
 
 from .layers import MultiheadAttentionBlock, InducedSelfAttentionBlock
@@ -79,7 +80,8 @@ class Encoder(nn.Module):
         src: Tensor,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
-    ) -> Tensor:
+        attention_rollout: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Process input through the stacked blocks.
 
         Parameters
@@ -101,16 +103,49 @@ class Encoder(nn.Module):
               - The first `attn_mask` tokens perform self-attention only (attend to themselves)
               - The remaining tokens attend only to the first `attn_mask` tokens
 
+        attention_rollout : bool, default=False
+            Whether to compute and return attention rollout across all layers.
+            Attention rollout tracks the effective attention flow from input to output
+            by accumulating attention weights across layers with residual connections.
+
         Returns
         -------
-        Tensor
-            Output tensor of shape (..., seq_len, d_model)
+        Tensor | tuple[Tensor, Tensor]
+            If attention_rollout=False: Output tensor of shape (..., seq_len, d_model)
+            If attention_rollout=True: Tuple of (output tensor, rollout matrix of shape (..., seq_len, seq_len))
         """
         out = src
-        for block in self.blocks:
-            out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope)
+        
+        if attention_rollout:
+            # Initialize rollout with identity matrix
+            batch_shape = src.shape[:-2]
+            seq_len = src.shape[-2]
+            rollout = torch.eye(seq_len, device=src.device, dtype=src.dtype)
+            if batch_shape:
+                rollout = rollout.expand(*batch_shape, seq_len, seq_len).clone()
+            #breakpoint()
+            for block in self.blocks:
+                out, attn_weights = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope, need_weights=True)
+                
+                # Average over attention heads (dimension -3 is num_heads)
+                attn_avg = attn_weights.mean(dim=-3)
 
-        return out
+                # Add residual connection (identity) and renormalize
+                # This accounts for the skip connection in the transformer block
+                eye = torch.eye(seq_len, device=src.device, dtype=src.dtype)
+                if batch_shape:
+                    eye = eye.expand(*batch_shape, seq_len, seq_len)
+                attn_residual = 0.5 * attn_avg + 0.5 * eye
+                
+                # Accumulate: multiply current rollout with current layer's attention
+                rollout = torch.matmul(rollout, attn_residual)
+            
+            return out, rollout
+        else:
+            for block in self.blocks:
+                out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope)
+            
+            return out
 
 
 class SetTransformer(nn.Module):

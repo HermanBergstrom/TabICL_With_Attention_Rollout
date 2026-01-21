@@ -7,6 +7,7 @@ from .embedding import ColEmbedding
 from .interaction import RowInteraction
 from .learning import ICLearning
 from .inference_config import InferenceConfig
+import torch
 
 
 class TabICL(nn.Module):
@@ -198,7 +199,8 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
-    ) -> Tensor:
+        return_attention_rollout: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -232,11 +234,14 @@ class TabICL(nn.Module):
         inference_config: InferenceConfig
             Inferenece configuration
 
+        return_attention_rollout : bool, default=False
+            Whether to return attention rollout from the row interaction transformer
+
         Returns
         -------
-        Tensor
-            Raw logits or probabilities for test samples of shape (B, test_size, num_classes)
-            where test_size = T - train_size
+        Tensor | tuple[Tensor, Tensor]
+            If return_attention_rollout=False: Raw logits or probabilities for test samples of shape (B, test_size, num_classes)
+            If return_attention_rollout=True: Tuple of (logits/probabilities, attention rollout matrix)
         """
 
         train_size = y_train.shape[1]
@@ -246,7 +251,7 @@ class TabICL(nn.Module):
             inference_config = InferenceConfig()
 
         # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
+        row_result = self.row_interactor(
             self.col_embedder(
                 X,
                 train_size=None if embed_with_test else train_size,
@@ -254,7 +259,17 @@ class TabICL(nn.Module):
                 mgr_config=inference_config.COL_CONFIG,
             ),
             mgr_config=inference_config.ROW_CONFIG,
+            return_attention_rollout=return_attention_rollout,
         )
+
+        if return_attention_rollout:
+            representations, row_emb_rollout = row_result
+        else:
+            representations = row_result
+
+        #save representations for debugging
+        #torch.save(representations, '/home/hermanb/scratch/TabICL_Experiments/debugging/representations.pt')
+
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(
@@ -263,9 +278,14 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
+            return_attention_rollout=return_attention_rollout,
         )
 
-        return out
+        if return_attention_rollout:
+            out, icl_rollout = out
+            return out, (row_emb_rollout, icl_rollout)
+        else:
+            return out
 
     def forward(
         self,
@@ -277,7 +297,8 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
-    ) -> Tensor:
+        return_attention_rollout: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -314,20 +335,25 @@ class TabICL(nn.Module):
         inference_config: InferenceConfig
             Inferenece configuration. Used only in training mode.
 
+        return_attention_rollout : bool, default=False
+            Whether to return attention rollout from the row interaction transformer. Used only in inference mode.
+
         Returns
         -------
-        Tensor
+        Tensor | tuple[Tensor, Tensor]
             For training mode:
               Raw logits of shape (B, T-train_size, max_classes), which will be further handled by the training code.
 
             For inference mode:
-              Raw logits or probabilities for test samples of shape (B, T-train_size, num_classes).
+              If return_attention_rollout=False: Raw logits or probabilities for test samples of shape (B, T-train_size, num_classes).
+              If return_attention_rollout=True: Tuple of (logits/probabilities, attention rollout matrix)
         """
 
         if self.training:
             out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
+            return out
         else:
-            out = self._inference_forward(
+            result = self._inference_forward(
                 X,
                 y_train,
                 feature_shuffles=feature_shuffles,
@@ -335,6 +361,6 @@ class TabICL(nn.Module):
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
+                return_attention_rollout=return_attention_rollout,
             )
-
-        return out
+            return result

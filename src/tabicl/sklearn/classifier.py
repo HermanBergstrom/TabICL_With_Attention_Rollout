@@ -623,3 +623,168 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         e_x = np.exp(x - x_max)
         # Compute softmax
         return e_x / np.sum(e_x, axis=axis, keepdims=True)
+
+    def predict_proba_with_rollout(self, X):
+        """Predict class probabilities and return attention rollouts from RowInteraction and ICLearning modules.
+
+        This method provides the same predictions as predict_proba but additionally returns
+        the attention rollout matrices from the row interaction and in-context learning transformers
+        for each ensemble member. The attention rollouts show the effective attention flow across
+        all transformer layers.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Test samples for prediction.
+
+        Returns
+        -------
+        proba : np.ndarray of shape (n_samples, n_classes)
+            Class probabilities for each test sample.
+
+        rollout_matrices : dict with keys 'row_emb' and 'icl'
+            Dictionary containing two types of rollout matrices, each with one entry per ensemble member:
+            - 'row_emb': List of attention rollout matrices from row embedding transformer.
+              Each matrix has shape (n_samples, seq_len, seq_len) where seq_len includes both CLS tokens and features.
+            - 'icl': List of attention rollout matrices from in-context learning transformer.
+              Each matrix has shape (n_samples, seq_len, seq_len).
+        """
+        check_is_fitted(self)
+        if isinstance(X, np.ndarray) and len(X.shape) == 1:
+            # Reject 1D arrays to maintain sklearn compatibility
+            raise ValueError(f"The provided input X is one-dimensional. Reshape your data.")
+
+        if self.n_jobs is not None:
+            assert self.n_jobs != 0
+            old_n_threads = torch.get_num_threads()
+
+            import multiprocessing as mp
+
+            n_logical_cores = mp.cpu_count()
+
+            if self.n_jobs > 0:
+                if self.n_jobs > n_logical_cores:
+                    warnings.warn(
+                        f"TabICL got n_jobs={self.n_jobs} but there are only {n_logical_cores} logical cores available."
+                        f" Only {n_logical_cores} threads will be used."
+                    )
+                n_threads = min(n_logical_cores, self.n_jobs)
+            else:
+                n_threads = max(1, mp.cpu_count() + 1 + self.n_jobs)
+
+            torch.set_num_threads(n_threads)
+
+        # Preserve DataFrame structure to retain column names and types for correct feature transformation
+        X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
+        X = self.X_encoder_.transform(X)
+
+        data = self.ensemble_generator_.transform(X)
+        outputs = []
+        row_emb_rollouts = []
+        icl_rollouts = []
+        
+        for norm_method, (Xs, ys) in data.items():
+            shuffle_patterns = self.ensemble_generator_.feature_shuffle_patterns_[norm_method]
+            
+            batch_size = self.batch_size or Xs.shape[0]
+            n_batches = np.ceil(Xs.shape[0] / batch_size)
+            Xs_batches = np.array_split(Xs, n_batches)
+            ys_batches = np.array_split(ys, n_batches)
+            if shuffle_patterns is None:
+                shuffle_patterns_batches = [None] * n_batches
+            else:
+                shuffle_patterns_batches = np.array_split(shuffle_patterns, n_batches)
+
+            batch_outputs = []
+            batch_row_emb_rollouts = []
+            batch_icl_rollouts = []
+            for X_batch, y_batch, pattern_batch in zip(Xs_batches, ys_batches, shuffle_patterns_batches):
+                X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+                y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+                if pattern_batch is not None:
+                    pattern_batch = pattern_batch.tolist()
+
+                with torch.no_grad():
+                    out, (row_emb_rollout, icl_rollout) = self.model_(
+                        X_batch,
+                        y_batch,
+                        feature_shuffles=pattern_batch,
+                        return_logits=True if self.average_logits else False,
+                        softmax_temperature=self.softmax_temperature,
+                        inference_config=self.inference_config_,
+                        return_attention_rollout=True,
+                    )
+                batch_outputs.append(out.float().cpu().numpy())
+                batch_row_emb_rollouts.append(row_emb_rollout.float().cpu().numpy())
+                batch_icl_rollouts.append(icl_rollout.float().cpu().numpy())
+            
+            outputs.append(np.concatenate(batch_outputs, axis=0))
+            row_emb_rollouts.append(np.concatenate(batch_row_emb_rollouts, axis=0))
+            icl_rollouts.append(np.concatenate(batch_icl_rollouts, axis=0))
+
+        outputs = np.concatenate(outputs, axis=0)
+
+        # Extract class shift offsets from ensemble generator
+        class_shift_offsets = []
+        for offsets in self.ensemble_generator_.class_shift_offsets_.values():
+            class_shift_offsets.extend(offsets)
+
+        # Determine actual number of ensemble members
+        n_estimators = len(class_shift_offsets)
+
+        # Aggregate predictions from all ensemble members, correcting for class shifts
+        avg = None
+        for i, offset in enumerate(class_shift_offsets):
+            out = outputs[i]
+            # Reverse the class shift
+            out = np.concatenate([out[..., offset:], out[..., :offset]], axis=-1)
+
+            if avg is None:
+                avg = out
+            else:
+                avg += out
+
+        # Calculate ensemble average
+        avg /= n_estimators
+
+        # Convert logits to probabilities if required
+        if self.average_logits:
+            avg = self.softmax(avg, axis=-1, temperature=self.softmax_temperature)
+
+        if self.n_jobs is not None:
+            torch.set_num_threads(old_n_threads)
+
+        # Normalize probabilities to sum to 1
+        proba = avg / avg.sum(axis=1, keepdims=True)
+        
+        rollout_matrices = {"row_emb": row_emb_rollouts, "icl": icl_rollouts}
+        return proba, rollout_matrices
+
+    def predict_with_rollout(self, X):
+        """Predict class labels and return attention rollouts from RowInteraction and ICLearning modules.
+
+        Uses predict_proba_with_rollout to get class probabilities and rollout matrices,
+        then returns the class with the highest probability for each sample along with
+        the rollout matrices.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Test samples for prediction.
+
+        Returns
+        -------
+        y : array-like of shape (n_samples,)
+            Predicted class labels for each test sample.
+
+        rollout_matrices : dict with keys 'row_emb' and 'icl'
+            Dictionary containing two types of rollout matrices, each with one entry per ensemble member:
+            - 'row_emb': List of attention rollout matrices from row embedding transformer.
+              Each matrix has shape (n_samples, seq_len, seq_len) where seq_len includes both CLS tokens and features.
+            - 'icl': List of attention rollout matrices from in-context learning transformer.
+              Each matrix has shape (n_samples, seq_len, seq_len).
+        """
+        proba, rollout_matrices = self.predict_proba_with_rollout(X)
+        y = np.argmax(proba, axis=1)
+        
+        return self.y_encoder_.inverse_transform(y), rollout_matrices
