@@ -624,7 +624,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         # Compute softmax
         return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
-    def predict_proba_with_rollout(self, X):
+    def predict_proba_with_rollout(self, X, return_row_emb = False):
         """Predict class probabilities and return attention rollouts from RowInteraction and ICLearning modules.
 
         This method provides the same predictions as predict_proba but additionally returns
@@ -637,17 +637,23 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         X : array-like of shape (n_samples, n_features)
             Test samples for prediction.
 
+        return_row_emb : bool, default=False
+            Whether to return representations produced by the row embedding transformer (Section 3.3).
+
         Returns
         -------
         proba : np.ndarray of shape (n_samples, n_classes)
             Class probabilities for each test sample.
 
-        rollout_matrices : dict with keys 'row_emb' and 'icl'
+                rollout_matrices : dict with keys 'row_emb_rollout', 'icl_rollout', and optionally 'row_embeddings'
             Dictionary containing two types of rollout matrices, each with one entry per ensemble member:
-            - 'row_emb': List of attention rollout matrices from row embedding transformer.
+            - 'row_emb_rollout': List of attention rollout matrices from row embedding transformer.
               Each matrix has shape (n_samples, seq_len, seq_len) where seq_len includes both CLS tokens and features.
-            - 'icl': List of attention rollout matrices from in-context learning transformer.
+            - 'icl_rollout': List of attention rollout matrices from in-context learning transformer.
               Each matrix has shape (n_samples, seq_len, seq_len).
+                        - 'row_embeddings' (included when return_row_emb=True): List of representation tensors produced by
+                            the row embedding transformer (Section 3.3), shaped per ensemble member. Each entry corresponds
+                            to the concatenated representations across batches for that ensemble member.
         """
         check_is_fitted(self)
         if isinstance(X, np.ndarray) and len(X.shape) == 1:
@@ -682,6 +688,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         outputs = []
         row_emb_rollouts = []
         icl_rollouts = []
+        representations_list = []
         
         for norm_method, (Xs, ys) in data.items():
             shuffle_patterns = self.ensemble_generator_.feature_shuffle_patterns_[norm_method]
@@ -698,6 +705,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             batch_outputs = []
             batch_row_emb_rollouts = []
             batch_icl_rollouts = []
+            batch_representations = []
             for X_batch, y_batch, pattern_batch in zip(Xs_batches, ys_batches, shuffle_patterns_batches):
                 X_batch = torch.from_numpy(X_batch).float().to(self.device_)
                 y_batch = torch.from_numpy(y_batch).float().to(self.device_)
@@ -705,7 +713,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                     pattern_batch = pattern_batch.tolist()
 
                 with torch.no_grad():
-                    out, (row_emb_rollout, icl_rollout) = self.model_(
+                    out, (row_emb_rollout, icl_rollout), representations = self.model_(
                         X_batch,
                         y_batch,
                         feature_shuffles=pattern_batch,
@@ -713,14 +721,19 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                         softmax_temperature=self.softmax_temperature,
                         inference_config=self.inference_config_,
                         return_attention_rollout=True,
+                        return_row_emb=return_row_emb,
                     )
                 batch_outputs.append(out.float().cpu().numpy())
                 batch_row_emb_rollouts.append(row_emb_rollout.float().cpu().numpy())
                 batch_icl_rollouts.append(icl_rollout.float().cpu().numpy())
+                if return_row_emb and representations is not None:
+                    batch_representations.append(representations.float().cpu().numpy())
             
             outputs.append(np.concatenate(batch_outputs, axis=0))
             row_emb_rollouts.append(np.concatenate(batch_row_emb_rollouts, axis=0))
             icl_rollouts.append(np.concatenate(batch_icl_rollouts, axis=0))
+            if return_row_emb and len(batch_representations) > 0:
+                representations_list.append(np.concatenate(batch_representations, axis=0))
 
         outputs = np.concatenate(outputs, axis=0)
 
@@ -757,10 +770,12 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         # Normalize probabilities to sum to 1
         proba = avg / avg.sum(axis=1, keepdims=True)
         
-        rollout_matrices = {"row_emb": row_emb_rollouts, "icl": icl_rollouts}
+        rollout_matrices = {"row_emb_rollout": row_emb_rollouts, "icl_rollout": icl_rollouts}
+        if return_row_emb:
+            rollout_matrices["row_embeddings"] = representations_list
         return proba, rollout_matrices
 
-    def predict_with_rollout(self, X):
+    def predict_with_rollout(self, X, return_row_emb = False):
         """Predict class labels and return attention rollouts from RowInteraction and ICLearning modules.
 
         Uses predict_proba_with_rollout to get class probabilities and rollout matrices,
@@ -772,19 +787,24 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         X : array-like of shape (n_samples, n_features)
             Test samples for prediction.
 
+        return_row_emb : bool, default=False
+            Whether to return representations produced by the row embedding transformer (Section 3.3).
+
         Returns
         -------
         y : array-like of shape (n_samples,)
             Predicted class labels for each test sample.
 
-        rollout_matrices : dict with keys 'row_emb' and 'icl'
+        rollout_matrices : dict with keys 'row_emb_rollout', 'icl_rollout', and optionally 'row_embeddings'
             Dictionary containing two types of rollout matrices, each with one entry per ensemble member:
-            - 'row_emb': List of attention rollout matrices from row embedding transformer.
+            - 'row_emb_rollout': List of attention rollout matrices from row embedding transformer.
               Each matrix has shape (n_samples, seq_len, seq_len) where seq_len includes both CLS tokens and features.
-            - 'icl': List of attention rollout matrices from in-context learning transformer.
+            - 'icl_rollout': List of attention rollout matrices from in-context learning transformer.
               Each matrix has shape (n_samples, seq_len, seq_len).
+            - 'row_embeddings' (included when return_row_emb=True): List of representation tensors produced by
+              the row embedding transformer (Section 3.3), shaped per ensemble member.
         """
-        proba, rollout_matrices = self.predict_proba_with_rollout(X)
+        proba, rollout_matrices = self.predict_proba_with_rollout(X, return_row_emb=return_row_emb)
         y = np.argmax(proba, axis=1)
         
         return self.y_encoder_.inverse_transform(y), rollout_matrices

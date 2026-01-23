@@ -200,7 +200,8 @@ class TabICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
         return_attention_rollout: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor]:
+        return_row_emb: bool = False,
+    ) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor], Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -283,7 +284,10 @@ class TabICL(nn.Module):
 
         if return_attention_rollout:
             out, icl_rollout = out
-            return out, (row_emb_rollout, icl_rollout)
+            if return_row_emb:
+                return out, (row_emb_rollout, icl_rollout), representations
+            else:
+                return out, (row_emb_rollout, icl_rollout), None
         else:
             return out
 
@@ -298,7 +302,8 @@ class TabICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
         return_attention_rollout: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor]:
+        return_row_emb: bool = False,
+    ) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor], Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -338,9 +343,12 @@ class TabICL(nn.Module):
         return_attention_rollout : bool, default=False
             Whether to return attention rollout from the row interaction transformer. Used only in inference mode.
 
+        return_row_emb : bool, default=False
+            Whether to return row embeddings from the row interaction transformer. Used only in inference mode.
+
         Returns
         -------
-        Tensor | tuple[Tensor, Tensor]
+        Tensor | tuple[Tensor, tuple[Tensor, Tensor], Tensor]
             For training mode:
               Raw logits of shape (B, T-train_size, max_classes), which will be further handled by the training code.
 
@@ -362,5 +370,6 @@ class TabICL(nn.Module):
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
                 return_attention_rollout=return_attention_rollout,
+                return_row_emb=return_row_emb,
             )
             return result
