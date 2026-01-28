@@ -197,6 +197,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        k: Optional[int] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -216,6 +217,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.k = k
 
     def _more_tags(self):
         """Mark classifier as non-deterministic to bypass certain sklearn tests."""
@@ -480,6 +482,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
                     inference_config=self.inference_config_,
+                    k=self.k,
                 )
             outputs.append(out.float().cpu().numpy())
 
@@ -655,6 +658,10 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                             the row embedding transformer (Section 3.3), shaped per ensemble member. Each entry corresponds
                             to the concatenated representations across batches for that ensemble member.
         """
+        #Throw error if k is not None
+        if self.k is not None:
+            raise ValueError("predict_with_rollout does not support k-NN context retrieval. Please set k=None when initializing the classifier to use this method.")
+        
         check_is_fitted(self)
         if isinstance(X, np.ndarray) and len(X.shape) == 1:
             # Reject 1D arrays to maintain sklearn compatibility
@@ -722,6 +729,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                         inference_config=self.inference_config_,
                         return_attention_rollout=True,
                         return_row_emb=return_row_emb,
+                        k=self.k,
                     )
                 batch_outputs.append(out.float().cpu().numpy())
                 batch_row_emb_rollouts.append(row_emb_rollout.float().cpu().numpy())
@@ -804,6 +812,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             - 'row_embeddings' (included when return_row_emb=True): List of representation tensors produced by
               the row embedding transformer (Section 3.3), shaped per ensemble member.
         """
+
         proba, rollout_matrices = self.predict_proba_with_rollout(X, return_row_emb=return_row_emb)
         y = np.argmax(proba, axis=1)
         

@@ -59,6 +59,7 @@ class ICLearning(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        n_classes: int = None,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -80,6 +81,7 @@ class ICLearning(nn.Module):
         self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, max_classes))
 
         self.inference_mgr = InferenceManager(enc_name="tf_icl", out_dim=max_classes)
+        self.n_classes = n_classes
 
     def _grouping(self, num_classes: int) -> tuple[Tensor, int]:
         """Divide classes into balanced groups for hierarchical classification.
@@ -267,7 +269,9 @@ class ICLearning(nn.Module):
         """
 
         train_size = y_train.shape[1]
-        num_classes = len(torch.unique(y_train[0]))
+        
+        #num_classes = len(torch.unique(y_train[0]))
+        num_classes = self.n_classes if self.n_classes is not None else len(torch.unique(y_train))
         
         if return_attention_rollout:
             out, attention_rollout = self._icl_predictions(R, y_train, return_attention_rollout=True)
@@ -408,10 +412,14 @@ class ICLearning(nn.Module):
             )
         self.inference_mgr.configure(**mgr_config)
 
-        num_classes = len(torch.unique(y_train[0]))
-        assert all(
-            len(torch.unique(yi)) == num_classes for yi in y_train
-        ), "All tables must have the same number of classes"
+        #TODO: Fix!
+        #num_classes = len(torch.unique(y_train[0]))
+        num_classes = self.n_classes if self.n_classes is not None else len(torch.unique(y_train))
+        
+        #TODO: Why was this here?
+        #assert all(
+        #    len(torch.unique(yi)) == num_classes for yi in y_train
+        #), "All tables must have the same number of classes"
 
         if num_classes <= self.max_classes:
             # Standard classification

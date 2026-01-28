@@ -123,22 +123,21 @@ class Encoder(nn.Module):
             rollout = torch.eye(seq_len, device=src.device, dtype=src.dtype)
             if batch_shape:
                 rollout = rollout.expand(*batch_shape, seq_len, seq_len).clone()
-            #breakpoint()
+
             for block in self.blocks:
                 out, attn_weights = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope, need_weights=True)
                 
-                # Average over attention heads (dimension -3 is num_heads)
                 attn_avg = attn_weights.mean(dim=-3)
 
-                # Add residual connection (identity) and renormalize
-                # This accounts for the skip connection in the transformer block
                 eye = torch.eye(seq_len, device=src.device, dtype=src.dtype)
                 if batch_shape:
                     eye = eye.expand(*batch_shape, seq_len, seq_len)
+
                 attn_residual = 0.5 * attn_avg + 0.5 * eye
+                attn_residual = attn_residual / attn_residual.sum(dim=-1, keepdim=True)
+
                 
-                # Accumulate: multiply current rollout with current layer's attention
-                rollout = torch.matmul(rollout, attn_residual)
+                rollout = torch.matmul(attn_residual, rollout)
             
             return out, rollout
         else:

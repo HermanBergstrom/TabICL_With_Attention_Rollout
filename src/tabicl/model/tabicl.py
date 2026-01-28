@@ -144,6 +144,116 @@ class TabICL(nn.Module):
             norm_first=norm_first,
         )
 
+    def _icl_retrieval_forward(
+        self, representations, y_train, train_size, k=None, return_logits=True, softmax_temperature=0.9, inference_config=None, return_attention_rollout=False
+    ):
+
+        B, T, D = representations.shape
+        train_reps = representations[:, :train_size, :]  # (B, train_size, D)
+        test_reps = representations[:, train_size:, :]   # (B, test_size, D)
+        
+        # Compute pairwise distances between test and train representations
+        dists = torch.cdist(test_reps, train_reps, p=2)  # (B, test_size, train_size)
+
+        k = min(k, train_size) 
+
+        # For each test sample, find the k closest training samples
+        knn_dists, knn_indices = torch.topk(dists, k=k, dim=-1, largest=False)  # (B, test_size, k)
+
+        #Compare against random retrieval
+        random_indices = torch.randint(0, train_size, (B, test_reps.size(1), k), device=representations.device)  # (B, test_size, k)
+
+        # Gather the representations of the k nearest neighbors
+        knn_reps = torch.gather(
+            train_reps.unsqueeze(1).expand(-1, test_reps.size(1), -1, -1),  # (B, test_size, train_size, D)
+            2,
+            knn_indices.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, test_size, k, D)
+        )  # (B, test_size, k, D)
+
+        knn_labels = torch.gather(
+            y_train.unsqueeze(1).expand(-1, test_reps.size(1), -1),  # (B, test_size, train_size)
+            2,
+            knn_indices  # (B, test_size, k)
+        )  # (B, test_size, k)
+
+        # For each test sample, make a call to the icl_predictor with its k nearest neighbors as context
+        B, test_size, _ = test_reps.shape
+        
+        # Reshape to (B*test_size, k, D) for batch processing
+        context_samples_flat = knn_reps.reshape(B * test_size, k, D)  # (B*test_size, k, D)
+        test_samples_flat = test_reps.reshape(B * test_size, 1, D)  # (B*test_size, 1, D)
+        
+        # Combine context samples and test samples
+        icl_input = torch.cat([context_samples_flat, test_samples_flat], dim=1)  # (B*test_size, k+1, D)
+        
+        # Reshape labels to (B*test_size, k)
+        y_train_flat = knn_labels.reshape(B * test_size, k)  # (B*test_size, k)
+        
+        use_icl_microbatching = False
+        icl_microbatch_size = 64  # Adjust based on memory constraints
+        if not use_icl_microbatching:
+            print("Using single forward pass for ICL retrieval")
+            icl_input = torch.cat(
+                [context_samples_flat, test_samples_flat], dim=1
+            )
+
+            icl_output = self.icl_predictor(
+                icl_input,
+                y_train=y_train_flat,
+                return_logits=return_logits,
+                softmax_temperature=softmax_temperature,
+                mgr_config=inference_config.ICL_CONFIG,
+                return_attention_rollout=return_attention_rollout,
+            )  # (B*test_size, k+1, num_classes)
+
+            if return_attention_rollout:
+                test_logits_flat = icl_output[0][:, -1, :]
+                attention_rollout = icl_output[1]
+            else:
+                test_logits_flat = icl_output[:, -1, :]
+        else:
+            print("Using microbatching for ICL retrieval")
+            n_classes = torch.unique(y_train).size(0)
+            self.icl_predictor.n_classes = n_classes
+
+            outputs = []
+            total = context_samples_flat.size(0)
+
+            for start in range(0, total, icl_microbatch_size):
+                end = min(start + icl_microbatch_size, total)
+
+                icl_input = torch.cat(
+                    [
+                        context_samples_flat[start:end],
+                        test_samples_flat[start:end],
+                    ],
+                    dim=1,
+                )
+  
+                icl_out = self.icl_predictor(
+                    icl_input,
+                    y_train=y_train_flat[start:end],
+                    return_logits=return_logits,
+                    softmax_temperature=softmax_temperature,
+                    mgr_config=inference_config.ICL_CONFIG,
+                    return_attention_rollout=return_attention_rollout,
+                )
+
+                if return_attention_rollout:
+                    outputs.append(icl_out[0][:, -1, :])
+                else:
+                    outputs.append(icl_out[:, -1, :])
+
+            test_logits_flat = torch.cat(outputs, dim=0)
+
+        # Reshape back to (B, test_size, num_classes)
+        icl_outputs = test_logits_flat.reshape(B, test_size, -1)
+        
+        if return_attention_rollout:
+            return icl_outputs, attention_rollout
+        else:
+            return icl_outputs
+
     def _train_forward(
         self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
     ) -> Tensor:
@@ -201,6 +311,7 @@ class TabICL(nn.Module):
         inference_config: InferenceConfig = None,
         return_attention_rollout: bool = False,
         return_row_emb: bool = False,
+        k: Optional[int] = None,
     ) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor], Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -270,8 +381,22 @@ class TabICL(nn.Module):
 
         #save representations for debugging
         #torch.save(representations, '/home/hermanb/scratch/TabICL_Experiments/debugging/representations.pt')
+        #Employ knn to determine context for each test sample
+        context_retrieval = k is not None
+        if context_retrieval:
+            out = self._icl_retrieval_forward(
+                representations,
+                y_train,
+                train_size,
+                k=k,
+                return_logits=return_logits,
+                softmax_temperature=softmax_temperature,
+                inference_config=inference_config,
+                return_attention_rollout=return_attention_rollout,
+            )
 
-
+            return out
+        
         # Dataset-wise in-context learning
         out = self.icl_predictor(
             representations,
@@ -303,6 +428,7 @@ class TabICL(nn.Module):
         inference_config: InferenceConfig = None,
         return_attention_rollout: bool = False,
         return_row_emb: bool = False,
+        k: Optional[int] = None,
     ) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor], Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -371,5 +497,6 @@ class TabICL(nn.Module):
                 inference_config=inference_config,
                 return_attention_rollout=return_attention_rollout,
                 return_row_emb=return_row_emb,
+                k=k,
             )
             return result
